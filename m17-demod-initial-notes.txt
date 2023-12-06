@@ -1,0 +1,44 @@
+m17-demod.cpp
+
+
+main reads cin and feeds one 16-bit sample at a time to demod()
+
+    using FloatType = float;
+    M17Demodulator<FloatType> demod(handle_frame);
+
+bool handle_frame(mobilinkd::M17FrameDecoder::output_buffer_t const& frame, int viterbi_cost)
+
+	M17Demodulator(callback_t callback)
+	: decoder(callback)
+	{}
+
+This constructor initializes decoder, which is a M17FrameDecoder, to use the callback passed in, which is handle_frame.
+
+later (line 548) there's this:
+
+template <typename FloatType>
+void M17Demodulator<FloatType>::operator()(const FloatType input)
+
+this is a function call operator and makes a FunctionObject type.
+
+Means a program can call demod(foo) where foo is a FloatType (and demod is a M17Demodulator type). This is used at line 489 in m17-demod.cpp
+
+FloatType is float, defined in m17-demod.cpp in main, and used to instantiate M17Demodulator demod.
+
+Correlator is in a SyncWord
+callback_t is part of M17FrameDecoder
+
+demod_filter is the BaseFirFilter that uses rrc_taps
+dcd is a DataCarrierDetect<FloatType, SampleRate=SAMPLE_RATE, Accuracy=500>
+	with freq1=2500, freq2=4000, ltrigger=1.0, htrigger=4.0
+	and those parameters are passed through to variables:
+	dft_ gets freq1 and freq1, and is an NDFT = NSlidingDFT
+	initialized with SampleRate=SAMPLE_RATE=48000, N=SAMPLE_RATE/Accuracy = 960 (length of DFT), K=2 (number of frequencies).
+	ltrigger_ and htrigger_ get ltrigger and htrigger.
+clock_recovery is a ClockRecovery
+correlator is a Correlator of appropriate FloatType
+the three sync_word_t items are SyncWord<Correlator> (defined in Correlator.h)
+dev is a FreqDevEstimator
+framer is a M17Framer<368>
+decoder is a M17FrameDecoder (created with callback handle_frame)
+sync_word_type is a M17FrameDecoder::SyncWordType initialized to LSF

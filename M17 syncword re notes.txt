@@ -1,0 +1,117 @@
+What's up with M17's sync word detection?
+
+in do_lsf_sync, we expect one sync word detection and a state change.
+
+we do nothing if not on sample_index
+
+check preamble correlator trigger. If preamble is detected AT ALL, we bail.
+
+check all sync words triggered()
+if BERT is triggered at all, go into FRAME state with sync_word_type = BERT.
+if LSF or STREAM is triggered at all, go into FRAME state with swt set.
+otherwise, count up to a frame worth of missed sync counts and declare UNLOCK.
+
+===========
+
+in do_stream_sync,
+we don't check against sample_index.  ???
+we also don't use triggered() at all.
+check the LSF/STREAM correlator and also its updated() state.
+count it
+if updated is negative AND count > 70,
+	update ??
+	go into FRAME with swt=STREAM
+else if count > 87 ??
+   	update ??
+   	count missing
+   	if not too many missing yet, go into FRAME with swt=STREAM
+   	if too many missing, drop back to LSF_SYNC
+
+===========
+
+triggered() nonzero means that the current correlation (ret value) exceeds
+the +/- limits set by correlator.limit() * magnitude_x. That is, it's big
+in absolute value.
+
+updated() pulls a current updated_ value and zeroes it out, so nonzero can
+only be returned once per something.
+The updated_ variable starts at 0, and gets set to +1 or -1 in operator()
+in case triggered() returns 0 and triggered_ is nonzero. This seems to mean
+that we just found the trailing edge of sync word detection.
+It scans samples_ for a sample that's bigger (abs value) than ...
+
+meh
+
+======
+operator()
+always returns timing_index_, which is the offset into samples_ where the
+biggest (abs value) sample is found.
+samples_ is an array of 10 floats (one symbol worth of samples). It is
+zeroed out when the correlator first triggers, and then filled with
+trigger values as they are nonzero.
+** if correlator.triggered() is zero and triggered_ is not set, nothing
+happens. This means we aren't in a sync word at all.
+** if correlator.triggered() is nonzero and triggered_ is not set, then
+we have entered a sync word's window. We zero out the samples_ buffer,
+and set triggered_. We then put the triggered() value into the buffer
+at the correlator.index() offset. That is, we begin to write down all
+the nonzero values returned by triggered() in a row.
+** if correlator.triggered() is nonzero and triggered_ is set, we just
+add the triggered() value into samples_ at offset(). That is, we continue
+to write down all the nonzero values.
+** finally, if correlator.triggered() is zero and triggered_ is set, then we've
+reached the end of the window. We turn off triggered_, and scan the buffer
+for the highest (abs value) entry. The value updated_ records the sign of
+that entry, and we return the index of that entry.
+
+So, a call to operator() returns the timing offset (while also running
+the syncword engine), and a call to updated() lets you find out whether
+there has been no correlation peak found or if it's a negative or positive
+peak.
+
+=====
+
+update_values()
+takes an index
+uses correlator.apply() to send the index to dev.sample()   ???
+calls dev.update()
+stores the index in sync_sample_index
+
+dev being the FreqDevEstimator object.
+
+=====
+M17 has three objects of type sync_word_t: preamble_sync, lsf_sync, and packet_sync, defined in M17Demodulator.h.
+lsf_sync is checked in do_unlocked and in do_stream_sync.
+In do_unlocked, a nonzero return from lsf_sync.updated() causes a transition
+to FRAME with the swt set according to its sign.
+In do_stream_sync, a negative return from lsf_sync.updated() (which means
+we found a STREAM syncword) causes something else a bit more complicated.....
+
+
+sync_count
+starts at 0
+zeroed when DCD comes on
+zeroed when preamble is detected
+zeroed when BERT syncword is detected
+incremented on every call to do_stream_sync or do_packet_sync or do_bert_sync
+checked >70 or >87 in do_stream_sync or do_packet_sync or do_bert_sync
+zeroed in do_frame after processing a frame
+
+71 is the earliest sample where some energy from each symbol has fallen
+into the right bin, so it's the earliest valid detection time (given that
+the previous frame boundary was correctly determined).
+
+We expect the correlator to exceed threshold for some number of samples.
+The middle samples of the last symbol of the sync word should be in that
+range, and it will have the largest value.  We don't find out about it
+until the window closes. So if the signal is super clean and the adjacent
+symbols are favorable, that may be a few samples beyond the end of the
+syncword.
+
+Any sync word detection that falls outside that window is bad; either it's
+an error or else there has been a timing jump in the received signal.
+If this happens a few times (MAX_MISSING_SYNC = 8), we drop back to looking
+for an LSF. (could be smarter using LICH decode info)
+
+So we completely disregard any syncword hits that are more than a few
+samples away from where we expect them to be.

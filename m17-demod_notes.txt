@@ -1,0 +1,508 @@
+Here is an informal narrative read-through of the code in m17-cxx-demod.
+I've included some questions, comments, and conclusions based on my
+current understanding of the code. None of these should be taken as
+gospel.
+
+So ... let's start where we pass a floating point sample to demod.
+That's in main. We read a 16-bit sample from cin, maybe invert it,
+and divide it by 44000.0 before passing it to demod.
+
+Nearly the first thing is that the sample is passed down to dcd.
+This happens unconditionally; DCD is always running.
+This is the only place dcd(sample) gets called.
+
+In DataCarrierDetect's operator(), it passes the sample on to 
+the operator() of dft_. Comments say we need 960 (20ms) of these
+before the result is valid. Since K=2, result_ is a pair of complex floats.
+Disregarding the validity requirement, we sum the norms (real^2 + imag^2)
+for each frequency into level_1 and level_2. These will be zeroed out
+when update() is called. Calling update() also computes level_ as a
+smoothed value of level_1/level_2, and decides triggered_ using ltrigger_
+and htrigger_ as hysteresis limits. That happens every 2 BLOCK_SIZE (80ms)
+when !dcd() (that is, when triggered_ is false) or 5 BLOCK_SIZE (200ms)
+when dcd() (that is, when triggered_ is true).
+
+So maybe DCD is partly invalid for first 80ms?
+
+When triggered_ transitions, we end up calling dcd_on() or dcd_off().
+These maintain a copy dcd_ of the current DCD state. dcd_on() resets
+sync_count and missing_sync_count, and also calls reset() on dev, framer,
+and decoder. This transition also sets need_clock_reset_, which is deferred
+until the correlator index is 0. dcd_off() just forces demodState to UNLOCKED.
+
+Back to demod(sample).
+
+During the first 40ms (1920 samples), we keep count_ at 0 and pass the
+sample into initialize(). This filters the sample with demod_filter()
+and feeds the filtered sample to correlator.sample(). This is a subset
+of normal processing, so we'll defer looking at details. Nothing else
+is done during this time.
+
+The rest of the time, we go on to check DCD status every 80ms until it
+shows detection. We're outputting the diagnostic_callback during this time,
+if enabled.
+
+After DCD triggers, we filter the sample with demod_filter() (this is just
+a BaseFirFilter using rrc_taps) and feed it to correlator.sample(). 
+(this is not operator() for no obvious reason). This takes the abs() of
+the sample and filters that with sample_filter, which is an order-3 IIR
+with hard-coded coefficients that claim "Nyquist of 1/240", whatever
+that means. The sample is put in buffer_, wrapping to 0 when buffer_ is full.
+buffer_ holds 80 filtered samples.
+
+Next we check correlator.index(). This is the buffer position modulo
+SAMPLES_PER_SYMBOL (which is 10). If that's 0, we might do a deferred
+clock_recovery.reset(), OR we might do a clock update, OR neither.
+Regardless, we follow that by passing the filtered sample to clock_recovery.
+
+ClockRecovery actually has comments!
+
+Then if the demodState isn't UNLOCKED and the correlator says (what?
+presumably that we're at the peak bit energy point) we pass the filtered
+sample into dev.sample(). 
+
+dev.sample() just maintains some summary info about mins and maxes and
+cheapo variance, between calls to dev.update(). Update converts the saved
+stats into estimates of deviation, offset, etc., and clears out the stats
+for the next round.
+
+Back in demod(sample) again.
+
+Next we check demodState. We're either looking for frame sync (UNLOCKED),
+trying to detect a specific expected sync word, or we've seen the sync word
+and now we're processing the frame. Each case has a do_ function which we call.
+
+After the state-dependent do_ function, if it has been 200ms since we
+updated DCD, we update DCD again. And that's the end of sample processing!
+
+Now let's look at those do_ functions.
+
+do_unlocked(). Possible next states: LSF_SYNC or FRAME.
+First operation depends on missing_sync_count. It's reset in many cases:
+when DCD turns on, when sync_updated is processed, if BERT_SYNC is detected,
+if a LSF or STREAM _SYNC is detected, if we declare UNLOCKED. It's incremented
+when: we process a symbol in UNLOCKED state and it's below 1920, if we're
+looking for LSF and not finding it, if we're looking for STREAM_SYNC or
+PACKET_SYNC or BERT_SYNC and something.
+
+The missing_sync_count is tested in several places. Here, we check that it's
+less than 1920. That is, that a whole frame hasn't gone by since we last
+reset missing_sync_count. If that's true, then we get the sync_index out
+of the preamble_sync correlator, and also get the current sync_updated results
+out of the correlator. If we received results, we reset the tracking loops,
+initialize sample_index from sync_index, and transition to LSF_SYNC state.
+Whether or not we received results, that's the end of processing for do_unlocked. In summary, we look for up to one full frame time for the
+preamble. (I think this only looks for 8 symbols of preamble).
+
+Still in do_unlocked(), if we've failed to obtain preamble sync for an entire
+frame time (since DCD detection), then we will try indefinitely to find
+one of the other sync types. We run the lsf_sync correlator, which can
+detect LSF (positive correlation) or STREAM (negative correlation) sync.
+If we found one, we transition to FRAME state with SyncWordType set to
+LSF or STREAM. If not, we run the packet_sync correlator, which can detect
+PACKET (positive correlation) or BERT (negative correlation) sync. We don't
+(yet) process PACKET, but if we detect BERT we transition to FRAME state
+with SyncWordType set to BERT. This handles the case where we correctly
+detected DCD when it was too late to detect the preamble, or if a fade
+took out the preamble. In these cases we will be able to process the
+signal correctly without ever seeing the preamble. This also runs if we
+detect DCD incorrectly, in which case we are going to search fruitlessly
+for sync words in the noise until we figure it out and drop DCD, which
+means a transition to the UNLOCKED state. In this case we are not looking
+for preamble, but we don't need to. If a real signal arrives while we're
+in this state, we'll detect the first non-preamble sync word and pick it
+up from there.
+
+This is not perfect. If we join in progress, it's possible that the type4
+data contains one of the sync words. In that case, we'll declare sync at the
+wrong time. Likely this will only keep us confused for one frame or a very
+few, before we have to declare failure and search again.
+
+The nominal-case progression from do_unlocked is to do_lsf_sync() because
+we heard the preamble and expect a LSF frame next, so let's look at that.
+
+In do_lsf_sync(), we look only at the current sample_index. That is, we
+assume that we have correct symbol timing. First, we check the preamble
+correlator. If it's firing, we guess that we're still receiving the preamble
+and do nothing. If all goes well, we'll do this until the preamble ends, at
+which time we expect to receive a sync word. This depends on the property
+that none of the sync words can be mistaken for preamble. This also handles
+the case where a new transmission interrupts the old one, and we're seeing
+preamble from the new.
+
+Once we're out of preamble territory, we run both the LSF/STREAM and the
+PACKET/BERT correlators. If the PACKET/BERT correlator fires with a BERT
+sync word, we immediately transition to FRAME state with SyncWordType BERT:
+a BERT transmission doesn't necessarily have a LSF frame at the beginning.
+If it fires with a PACKET sync word, we don't notice (yet). If the LSF/STREAM
+correlator fires, we also transition to FRAME state, with the corresponding
+SyncWordType of LSF or STREAM. If we don't do any of those transitions for
+192 iterations (as counted by missing_sync_count), we transition back to
+UNLOCKED state. That takes at least 192 symbol times, or one 40ms frame time,
+after the end of preamble detection. It could take arbitrarily longer if the
+preamble detector fires repeatedly, but that's unlikely.
+
+Now let's look at do_stream_sync(). In this state, we're expecting to find
+a STREAM sync word, either because we just processed an LSF or because we
+just processed a stream frame that didn't have the end-of-stream flag set.
+We run the LSF/STREAM correlator, and we keep track of how long we've been
+looking in the sync_count variable, which has been set to 0 before the
+state transition to STREAM_SYNC.
+
+If we detect the STREAM sync word and we've been looking for at least
+70 samples (which is 7 symbol times), we declare success and make the
+transition to demodState FRAME with SyncWordType STREAM.
+
+Otherwise, if we're still looking after 87 samples (8.7 symbol times),
+we declare that we've missed the sync word. If that hasn't happened too
+many times (MAX_MISSING_SYNC = 8), we shrug our cybershoulders and go ahead
+and make the transition to demodState FRAME with SyncWordType STREAM, just
+as if we had successfully received the sync word. If this happens too many
+times (MAX_MISSING_SYNC) then we punt back to demodState LSF_SYNC, where we
+can handle a bigger variety of success and failure conditions.
+
+do_packet_sync() can only be reached by accident currently, but let's look
+anyway. It's nearly identical to do_stream_sync(). The only difference is
+that in the failure case (MAX_MISSING_SYNC) it fails back to demodState
+UNLOCKED instead of LSF_SYNC.
+
+do_bert_sync() is identical to do_packet_sync().
+
+do_frame() is where the action is.
+
+First, it checks correlator.index() against sample_index, to verify that
+we still have symbol sync. If not, we do nothing.
+
+Next, we correct the input (a filtered sample) with recent results from
+the deviation estimator: we subtract the deviation offset, scale by the
+deviation factor, and possibly invert by multiplying by the polarity.
+Then we compute the LLR symbol map of the corrected sample, taken as
+representing the current symbol. The symbol map is then passed to framer,
+which is a M17Framer<368>. If framer returns a frame, it is passed to
+decoder, which is a M17FrameDecoder.
+
+The decoder returns a DecodeResult, which is an enum class for which the
+zero value is FAIL and the other values are non-failures. This value is not
+processed right away. The decoder also provides a viterbi_cost value, which
+we use to update a cost_count accumulator: +1 for values > 90, +2 for values
+> 100, +3 for values > 110. If that accumulator exceeds 75, we declare
+failure and transition to demodState UNLOCKED.
+
+The decoder also provides an accessor state(), which exposes its internal
+variable state_. Which is a State. Which is an enum of LSF, STREAM,
+BASIC_PACKET, FULL_PACKET, BERT. Based on this, we transition demodState
+to the corresponding state: STREAM and LSF to STREAM_SYNC, BERT to BERT_SYNC,
+and anything else to PACKET_SYNC.
+
+Now we get around to looking at the DecodeResult. If it's EOS, then we
+transition to demodState LSF_SYNC. Otherwise, nothing happens.
+
+OK, so do_frame is entirely supervisory. It's looking at metrics and
+state transitions, but does not handle the data at all, except to pass it
+from the M17Framer to the M17FrameDecoder. To follow the data, we need to
+look into M17FrameDecoder.
+
+M17FrameDecoder has the machinery: a M17Randomizer<368> called derandomize_,
+a PolynomialInterleaver<45, 92, 368> called interleaver_, a Trellis called
+trellis_, a Viterbi called viterbi_, and a CRC16 called crc_.  It has a
+State variable named state_ that starts out in LSF state, and a bunch of
+specialized buffers of int8_t or uint8_t.
+
+If you pass a callback_t into M17FrameDecoder it saves it in callback_. This
+is a function that takes an output_buffer_t& and returns a bool that's
+supposed to be false if the data is known to be bad.
+
+The hub of M17FrameDecoder is its operator() method, which takes a
+SyncWordType representing the type of the detected sync word, an
+input_buffer_t buffer that contains the frame's type4 bits, and the
+viterbi cost after decoding the frame.  It immediately uses its derandomize_
+to unscramble and interleaver_ to deinterleave the frame, yielding type3
+bits. Then it dispatches to decode_lsf, decode_lich, decode_stream,
+decode_packet, or decode_bert, depending on the SyncWordType and the state_.
+If the dispatch fails, the DecodeResult FAIL is returned.
+
+If the SyncWordType was LSF, state_ becomes LSF and we dispatch to decode_lsf
+and return the DecodeResult it returns.
+
+If the SyncWordType was STREAM, we check state_: LSF -> decode_lich,
+STREAM->decode_stream, any other state_ returns FAIL.
+
+If the SyncWordType was PACKET, we check state_. If it was BASIC_PACKET
+or FULL_PACKET, we dispatch decode_packet, passing in the corresponding
+FrameType. For any other state_, we transition to state_ LSF and return FAIL.
+
+If the SyncWordType was BERT, we transition to state_ BERT and dispatch
+decode_bert.
+
+Going through these one at a time, starting with decode_lsf.
+
+decode_lsf immediately depunctures the frame with pattern P1, obtaining
+type2 bits in depuncture_buffer.lsf. Then it uses viterbi_.decode to decode
+them to type1 bits in decode_buffer.lsf, obtaining the viterbi_cost as a
+return value. These bits are then packed into bytes with to_byte_array,
+filling up output_buffer.lsf.
+
+It uses crc_ to check the CRC of the LSF. If it passes, it calls its
+method update_state to look into the received LSF to determine a new value
+for state_ based on what the LSF describes: STREAM, BASIC_PACKET, FULL_PACKET.
+Then it marks output_buffer as containing (only) the LSF, calls callback_,
+and returns OK.
+
+If the CRC fails, it zeroes out output_buffer.lsf and lich_segments, and
+returns FAIL.
+
+callback_ is a callback_t, which is defined in a "using" statement to be
+std::function<bool(const output_buffer_t&, int)>. This typename is used
+in M17FrameDecoder.h and also imported into M17Demodulator.h, where it is
+used to describe the argument of a M17Demodulator constructor that passes
+its argument through to decoder, which is its instance of M17FrameDecoder.
+So in m17-demod.cpp near the top of main() where we see the declaration
+
+M17Demodulator<FloatType> demod(handle_frame);
+
+... this means that handle_frame is passed through to M17FrameDecoder as
+its callback_. This was a bit of a puzzle since handle_frame is not
+declared as a callback_t. It is, however, declared as
+
+bool handle_frame(mobilinkd::M17FrameDecoder::output_buffer_t const& frame, int viterbi_cost);
+
+... which is exactly the same type as callback_t. Cool.
+
+So, callback_ calls handle_frame(). Which switches on the type passed in
+with the output_buffer_t frame, and calls dump_lsf(). Which, if the
+display_lsf flag is true, outputs a summary of the LSF to cerr, using
+the decode_callsign method from LinkSetupFrame to make sense of the encoded
+source and destination callsigns, and calling dump_type() to decode the
+type field within the LSF.
+
+dump_lsf() then steps outside its nominal ambit and actually does a bit of
+processing for packet modes. It clears current_packet, and resets the
+packet_frame_counter. Then if the LSF calls for non-raw packet, it calls
+append_packet to copy the LSF into current_packet, packing it from bits to
+bytes in the process. Not clear why this is the right thing to do?
+
+Moving on to decode_lich ...
+
+decode_lich starts by filling output_buffer.lich with zeroes. Unnecessary.
+Then it calls unpack_lich(), which breaks the buffer up into 3-byte (i.e.,
+24-bit) Golay codewords, which it then attempts to decode using the Golay24
+decoder. If any of them fails to decode, unpack_lich() fails and
+decode_lich returns FAIL. Each successfully decoded codeword (12 bits) is
+copied into one whole byte and a half-byte of output_buffer.lich. If they
+all decoded successfully, unpack_lich succeeds and decode_lich continues.
+
+output_buffer.type is set to LICH, and now we're ready to call the callback_,
+which is handle_frame. It switches on type, and for the LICH case it just
+outputs a message to the stderr console that says "LICH".
+
+We extract the LSF fragment number from the last byte. If it's bogus, we
+mark the viterbi_cost as -1 and return INCOMPLETE. Otherwise, we copy the
+fragment from output_buffer.lich into the right part of output_buffer.lsf,
+as determined by the fragment number and flag that segment as received.
+If the segments have not all been received, we again mark the viterbi_cost
+as -1 and return INCOMPLETE.
+
+If we now have a complete LSF, we use CRC16 to compute the checksum of
+the LSF. If it passes, we move on to state_ STREAM with output_buffer.type
+marked as LSF, process the LSF through callback_ (i.e., handle_frame) just
+as if we'd received the LSF frame, and return OK.
+
+If the CRC failed, we don't know where the error is. But we resist the
+temptation to start over by wiping all the segments. Instead, we leave
+them all marked received and wait for a future received segment(s) to
+overwrite the segment(s) with error(s). We set the viterbi_cost high 128
+and return INCOMPLETE.
+
+We are perhaps abusing viterbi_cost here, since there's no viterbi decoder
+involved. By -1 we mean better than perfect, and by 128 we mean terrible.
+As far as I can tell, this value is never used for the LICH case.
+
+Now decode_bert ...
+
+decode_bert starts by depuncturing the buffer into depuncture_buffer.bert.
+That buffer is then Viterbi decoded into decode_buffer.bert. Those results
+are then packed into bytes by to_byte_array and placed in output_buffer.bert,
+with output_buffer.type set to BERT.
+
+The callback_ is then called, handle_frame, which calls decode_bert.
+decode_bert processes the 25*8 + 5 bits (205 bits) of the result through
+the PRBS (pseudorandom bit sequence). When the PRBS is synced, this just
+means checking to see if the bit is as expected, and counting bits and errors.
+If too many errors occur within a history window, we declare loss of sync.
+When the PRBS is not synced, it shifts the received bits into the sequence
+generator and checks for a run of successfully matching bits, which is
+a sync detection.
+
+The frame processing doesn't do anything with the BERT data except maintain
+counts of bits and errors. A function diagnostic_callback() is defined in
+m17-demod that prints to stderr, among other things, the BERT statistics.
+m17-demod registers this function with M17Demodulator by calling
+demod.diagnostics(). M17Demodulator then invokes the diagnostic callback
+function whenever it checks for DCD, which is every 80ms when DCD is not
+detected and every 200ms when it is.
+
+Now decode_stream ...
+
+decode_stream begins by copying the payload part of the input buffer into a
+tmp buffer, which is wasted effort but makes the buffer size correct for
+C++ template matching in the next line of code. It then depunctures tmp
+into depuncture_buffer.stream, and Viterbi decodes that into
+decode_buffer.stream. These results are then packed into bytes by
+to_byte_array and placed in output_buffer.stream.
+
+The viterbi_cost returned by the Viterbi decoder indicate whether the
+results are trustworthy. If the metric is below 60, we check the bit in
+the frame_number part of the decode_buffer that indicates the end of stream
+(EOS). If EOS is set, the state_ transitions to LSF to prepare for a
+possible next transmission.
+
+output_buffer.type is flagged as STREAM, and callback_ invoked to call
+handle_frame, which dispatches to demodulate_audio. In there, we again
+check the EOS bit, this time with a viterbi_cost threshold of 70. It it's
+set, we might (depending on boolean setting display_lsf) write the message
+"EOS" to stderr, and the eventual return value from handle_frame will be
+false. That false return value is supposed to mean that the frame was bad,
+but here it just means that stream decoding should not continue.
+
+Next, if the boolean flag noise_blanker is set, we check the viterbi cost
+against a looser threshold of 80. If the signal is worse than that, output
+a bunch of zero-value PCM samples to stdout: 40ms worth of silence.
+
+If we didn't blank the frame, we break out the two frames of codec2 data
+found within the voice-only stream frame, and decode them with codec2
+into 16-bit PCM samples in buf, which is then output to stdout.
+
+Lastly, decode_packet ...
+
+First, let's talk about BASIC_PACKET and FULL_PACKET as implemented here.
+In the protocol spec, these refer to modes of the "KISS TNC" interface.
+That is, they refer to the communication between the M17 implementation
+and the host computer that's communicating through it. This does not
+change the air interface. In BASIC mode, the interface carries only the
+packet data, and the transmitting M17 implementation is expected to
+synthesize an LSF with essentially dummy source and destination addresses. 
+The receiving M17 implementation strips off the LSF before sending it to
+the host. In FULL mode, the interface also carries the LSF. So the
+transmitting host prepends its own LSF to each packet on the interface,
+and the receiving M17 implementation relays the received LSF to the host
+by prepending it to each packet on the interface. These modes are
+distinguished on the interface by the KISS port number (0 for BASIC,
+1 for FULL). However, this implementation does not support the KISS
+interface at all, so this whole mechanism is only partly implemented.
+
+What's more, M17FrameDecoder::update_state() conflates the BASIC/FULL
+distinction with the data type indicator in the LSF. The spec calls
+for these two bits to select 00=reserved, 01=data, 10=voice, 11=voice+data.
+This doesn't really make much sense. Voice is only supported in stream
+mode, and there's no data or voice+data mode specified in stream mode.
+Data is only supported in packet mode. So the spec needs correction.
+My best guess is that the above values are intended to apply in stream
+mode, and that the data and voice+data choices are for a future expansion
+of the protocol spec that would divide up each frame into two half-frames,
+which could be allocated independently for voice and some kind of streaming
+data. But there's nothing else in the spec about either of these modes,
+except a table that says voice+data mode corresponds to a 1600 bps voice
+rate. None of this has anything to do with BASIC or FULL, though.
+
+What this implementation actually does is prepend the LSF to received
+packet data in what it thinks is FULL_PACKET mode. That's sort of like
+what's defined in the spec, if only it were framed according to the KISS
+TNC rules, and enabled by something other than the LSF. But it's not.
+And this implementation doesn't handle packet transmission at all, so
+there's no BASIC or FULL packet in m17-mod.
+
+Caution: there are two functions named decode_packet in this program.
+First we will see M17FrameDecoder::decode_packet. After a couple levels
+of indirection, it will call the plain function decode_packet found in
+m17-demod.cpp.
+
+M17FrameDecoder::decode_packet is a little different from the other
+decode_x routines in that it takes an extra argument, the frame type, which
+can be either BASIC_PACKET or FULL_PACKET.
+
+M17FrameDecoder::decode_packet starts by depuncturing the buffer into
+depuncture_buffer.packet. That buffer is then Viterbi decoded into
+decode_buffer.packet. Those results are then packed into bytes by
+to_byte_array and placed in output_buffer.packet, with output_buffer.type
+set to the frame type value passed in as an argument.
+
+The callback_ calls handle_frame as usual, which currently calls the same
+decode_packet function (in m17-demod.cpp) for both BASIC_PACKET and
+FULL_PACKET frames.
+
+decode_packet starts by examining the control fields in the last byte of
+the frame. The MS bit is checked first; it indicates that this is the last
+frame of the packet. In that case, the next five bits is the number of bytes
+in this frame (the rest are wasted). That number of bytes are taken from
+the frame and appended to the current packet. We next compute the CRC of
+the entire packet, using boost::crc_optimal instead of our built-in CRC16.
+If the CRC fails, we output a message to stderr and return false, which
+makes handle_frame return false, which makes callback_ return false back
+in M17FrameDecoder. There, the last frame bit is checked again, and will
+still be set, causing a transition of state_ to LSF and a return of FAIL.
+
+If the CRC passes, we create a std::string to hold the AX.25 frame we are
+assuming is contained in this packet, and copy the bytes into the string.
+We then pass that object to ax25_frame's constructor, which merely calls
+ax25_frame::parse. parse checks the length: if too short, it just returns.
+Then it calls parse_fcs, which extracts the FCS (frame check sequence,
+the CRC used in AX.25), reversing the order of its bits in the process.
+Next it calls parse_destination, which extracts the destination field from
+the packet. This field is further processed by fixup_address, which begins
+by checking the last bit of the destination field; the inverse of this bit
+becomes the return value from fixup_address, which is not used in this
+instance. The address is further processed by removeAddressExtensionBit,
+which shifts every byte right by one bit, discarding the LS bit (used to
+indicate that more address bytes are coming next in X.25 but meaningless
+in AX.25 iirc). Next we call getSSID to extract the four-bit Secondary
+Station Identifier from the address. We remove any trailing spaces and
+the SSID field from the address, which is now an ASCII string. Lastly
+we call appendSSID to reattach the SSID, if nonzero, to the address, in
+ASCII with a hyphen. The resulting std::string is updated in place, and
+fixup_address returns that last bit of the destination field, inverted.
+
+Back in parse, the source address is extracted in the same way using 
+parse_source and fixup_address. In this instance, the returned bool is
+meaningful: if true, that indicates the presence of further address fields,
+to be used as digipeaters. In that case, we call parse_repeaters to extract
+them. Each digipeater address is copied from the frame and processed by
+fixup_address, where the return value indicates that another digipeater
+address follows. We're careful not to go beyond the length of the whole
+packet. The resulting list of repeaters is returned as a vector of strings.
+
+Back in parse again, we compute the index of the first non-address byte
+by counting the addresses (destination, source, and any digipeaters) and
+multiplying by the length of an address. If this doesn't leave enough bytes
+to contain the rest of a valid packet, we return without further processing.
+Normally, we proceed to call parse_type to extract the two-bit frame type
+from the remaining header byte, and also remember that entire byte as
+raw_type_ (the AX.25 spec calls this the control field). If the frame type
+was UNNUMBERED (indicating a UI packet, used for beacons and CQs and any
+other "unprotocol" transmissions), we grab the next byte as the pid
+(protocol identifier). (I think this is wrong. Both I and UI frames
+contain a PID.) Finally, the remaining bytes (less two for the FCS) are assigned to the info_ field. This completes parse, which completes the
+ax25_frame constructor.
+
+Back in decode_packet, we emit a newline to stderr, and then call write
+to dump the whole packet in some sort of human-readable monitor format
+to stderr. This is done without regard for any non-printable characters
+that may exist in the address fields or in the info field. There is no
+attempt to dump the control field of the packet, much less process any
+of the AX.25 protocol. Now decode_packet returns true, which makes
+callback_ return true back in M17FrameDecoder. There, the last frame bit
+is checked again, and will still be set, causing a transition of state_
+to LSF and a return of OK. This implies that we expect to see the LSF
+transmitted before every packet.
+
+Recall that this was all done on the last frame of the packet. Now we're
+back in decode_packet, but with a non-last frame. We extract the five-bit
+frame number from the last byte of the frame, and check that it's the next
+value in sequence (as stored in packet_frame_counter). If not, we emit an
+error message to stderr and return false. Otherwise, we increment the
+packet_frame_counter, copy the frame contents in to the current_packet,
+and return true. Back in M17FrameDecoder::decode_packet, either return
+result is ignored. It returns a decode result of PACKET_INCOMPLETE. We
+don't transition state_ to LSF, even if the packet is already ruined by
+an out-of-sequence frame.
+
+Note that there's a function called decode_full_packet, but it is not used.
